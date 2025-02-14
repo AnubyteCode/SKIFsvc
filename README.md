@@ -14,3 +14,6 @@ Used by SKIF to hold the injection service in an easy-to-locate process.
 | `Start`  | Starts an instance of the service.  |
 | `Stop`  | Stops any running instances of the service. Can also be used to attempt to force-eject leftover injections of Special K.  |
 | `Proxy64`  | **Supported only by 32-bit SKIFsvc!** Proxies the command line argument to the 64-bit SKIFsvc. Used by SKIF to skip one UAC prompt if the service is launched elevated. |
+
+
+Version: 1.0.4.1
