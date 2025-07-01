@@ -1,5 +1,5 @@
 #include <Windows.h>
-#include <shlwapi.h>
+#include <shlwapi.h>        // For PathRemoveFileSpecW and StrStrIW
 #include <string>
 #include <memory>
 #include <algorithm>
@@ -161,6 +161,149 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
             break;
         }
     }
+#include <vector>
+#include <algorithm>
+#include <cstdarg>
+
+// Helper: check if a file exists and is not a directory
+inline bool FileExists(LPCWSTR path)
+{
+    DWORD attr = GetFileAttributesW(path);
+    return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+// Display a Win32 error message box with optional prefix and title
+void ShowErrorMessage(DWORD lastError, const std::wstring& preMsg = L"", const std::wstring& winTitle = L"Error")
+{
+    // Retrieve formatted system error message
+    LPWSTR buffer = nullptr;
+    DWORD size = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, lastError, 0,
+        reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+
+    std::wstring msg(buffer ? buffer : L"", size);
+    LocalFree(buffer);
+
+    // Strip out any stray newlines
+    msg.erase(std::remove(msg.begin(), msg.end(), L'\n'), msg.end());
+
+    // Build full message: optional prefix, error code + text
+    std::wstring full = preMsg;
+    if (!preMsg.empty())
+        full += L"\n\n";
+    full += L"[" + std::to_wstring(lastError) + L"] " + msg;
+
+    MessageBoxW(nullptr, full.c_str(), winTitle.c_str(), MB_OK | MB_ICONERROR);
+}
+
+// Format a wide string safely, using a stack buffer first, then heap if needed
+std::wstring SK_FormatStringW(const wchar_t* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+
+    // Try stack buffer
+    wchar_t stackBuf[4096];
+    int len = vswprintf_s(stackBuf, std::size(stackBuf), fmt, args);
+    va_end(args);
+
+    if (len >= 0 && len < (int)std::size(stackBuf))
+        return std::wstring(stackBuf, len);
+
+    // Need larger buffer: compute required length
+    va_start(args, fmt);
+    int required = _vscwprintf(fmt, args);
+    va_end(args);
+    if (required <= 0)
+        return {};
+
+    // Allocate and format
+    std::wstring result(required + 1, L'\0');
+    va_start(args, fmt);
+    vswprintf_s(result.data(), result.size(), fmt, args);
+    va_end(args);
+
+    // Trim trailing null
+    result.resize(lstrlenW(result.c_str()));
+    return result;
+}
+// Type for the injection function
+using DLL_t = void(WINAPI*)(HWND, HINSTANCE, LPCSTR, int);
+
+// Command strings for injection manager
+constexpr char kCmdInstall[] = "Install";
+constexpr char kCmdRemove[]  = "Remove";
+
+int WINAPI wWinMain(
+    _In_     HINSTANCE hInstance,
+    _In_opt_ HINSTANCE hPrevInstance,
+    _In_     LPWSTR    lpCmdLine,
+    _In_     int       nCmdShow)
+{
+    // Parse command-line for keywords
+    std::wstring cmd(lpCmdLine ? lpCmdLine : L"");
+    bool doStop   = (cmd.find(L"Stop")   != std::wstring::npos);
+    bool doStart  = (cmd.find(L"Start")  != std::wstring::npos);
+#ifndef _WIN64
+    bool proxy64  = (cmd.find(L"Proxy64")!= std::wstring::npos);
+#endif
+    // Get current directory safely
+    DWORD curSize = GetCurrentDirectoryW(0, nullptr);
+    std::wstring curDir;
+    if (curSize > 0) {
+        curDir.resize(curSize);
+        GetCurrentDirectoryW(curSize, curDir.data());
+        curDir.resize(lstrlenW(curDir.c_str()));
+    } else {
+        ShowErrorMessage(GetLastError(), L"Failed to get current directory");
+        return GetLastError();
+    }
+
+    // Get this executable's folder path
+    HMODULE hSelf = GetModuleHandleW(nullptr);
+    DWORD bufSize = MAX_PATH;
+    std::vector<wchar_t> buf(bufSize);
+    DWORD len = GetModuleFileNameW(hSelf, buf.data(), bufSize);
+    while (len == bufSize && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+        bufSize *= 2;
+        buf.resize(bufSize);
+        len = GetModuleFileNameW(hSelf, buf.data(), bufSize);
+    }
+    if (len == 0) {
+        ShowErrorMessage(GetLastError(), L"Failed to get module file name");
+        return GetLastError();
+    }
+    // Remove filename, leaving folder
+    PathRemoveFileSpecW(buf.data());
+    std::wstring exeFolder(buf.data());
+
+    // If running from a system folder, switch to exe folder
+    if (StrStrIW(curDir.c_str(), L"\\Windows\\Sys"))
+        SetCurrentDirectoryW(exeFolder.c_str());
+
+    // Decide DLL name based on architecture
+    std::wstring dllFile = 
+    #if _WIN64
+        L"SpecialK64.dll";
+    #else
+        L"SpecialK32.dll";
+    #endif
+
+    // Potential locations to search for the DLL
+    std::vector<std::wstring> candidates = {
+        dllFile,
+        L"..\\" + dllFile,
+        SK_FormatStringW(LR"(%ws\%ws)", exeFolder.c_str(), dllFile.c_str()),
+        SK_FormatStringW(LR"(%ws\..\%ws)", exeFolder.c_str(), dllFile.c_str())
+    };
+
+    // Pick the first existing path
+    std::wstring dllPath;
+    auto it = std::find_if(candidates.begin(), candidates.end(),
+        [](auto& p){ return FileExists(p.c_str()); });
+    if (it != candidates.end())
+        dllPath = *it;
 
     DWORD lastError = NO_ERROR;
     SetLastError(NO_ERROR);
@@ -206,6 +349,52 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     {
         lastError = GetLastError();
         ShowErrorMessage(lastError, L"There was a problem starting " + wsDllFile, L"SKIFsvc");
+    }
+
+    return lastError;
+}
+    // Load the DLL and locate the injection entrypoint
+    HMODULE hMod = LoadLibraryW(dllPath.c_str());
+    if (hMod) {
+        auto fn = reinterpret_cast<DLL_t>(
+            GetProcAddress(hMod, "RunDLL_InjectionManager"));
+        if (!fn) {
+            lastError = GetLastError();
+            ShowErrorMessage(lastError,
+                L"Failed to find RunDLL_InjectionManager in " + dllFile);
+            FreeLibrary(hMod);
+            return lastError;
+        }
+
+        // Invoke based on signals
+        if (doStop)
+            fn(nullptr, nullptr, kCmdRemove, SW_HIDE);
+        else if (doStart)
+            fn(nullptr, nullptr, kCmdInstall, SW_HIDE);
+        else {
+            // No explicit start/stop: signal existing service or install
+            LPCWSTR eventName = 
+            #if _WIN64
+                LR"(Local\SK_GlobalHookTeardown64)";
+            #else
+                LR"(Local\SK_GlobalHookTeardown32)";
+            #endif
+            HANDLE hEvt = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName);
+            if (hEvt) {
+                SetEvent(hEvt);
+                CloseHandle(hEvt);
+            } else {
+                fn(nullptr, nullptr, kCmdInstall, SW_HIDE);
+            }
+        }
+
+        Sleep(50);  // give the injection manager time to act
+        FreeLibrary(hMod);
+    }
+    else {
+        lastError = GetLastError();
+        ShowErrorMessage(lastError,
+            L"Failed to load " + dllFile, L"SKIFsvc");
     }
 
     return lastError;

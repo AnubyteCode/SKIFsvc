@@ -16,4 +16,4 @@ Used by SKIF to hold the injection service in an easy-to-locate process.
 | `Proxy64`  | **Supported only by 32-bit SKIFsvc!** Proxies the command line argument to the 64-bit SKIFsvc. Used by SKIF to skip one UAC prompt if the service is launched elevated. |
 
 
-Version: 1.0.4.1
+Version: 1.0.4.2
